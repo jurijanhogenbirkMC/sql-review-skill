@@ -1,0 +1,113 @@
+use Marktstrategie_prd
+
+--- gelabeld vs niet gelabeld patienten per jaar voor thorax
+select jaar_datum_verr as Jaar, case when rb_gelabeld_01_patient_NZA = 1 then 'Gelabeld' else 'Niet gelabeld' end as Gelabeld,count(distinct patientnr) as Aantal_patienten,count(distinct patientnr) * 100.0 / sum(count(distinct patientnr)) over (partition by jaar_datum_verr) as Percentage 
+from msd_tables.dbc_brontabel
+where jaar_datum_verr in (2023, 2024) AND qs_alt_specialisme_koppeldbc in ('LON', 'CAR','CTC') and indeling_verrichting = 'DBC'
+group by case when rb_gelabeld_01_patient_NZA = 1 then 'Gelabeld' else 'Niet gelabeld' end, jaar_datum_verr	
+
+--- radiologie count per opname met aantal radiologie verrichtingen, eerste en laatste radiologie verrichting in de opname periode
+SELECT o.opnamenr,
+       o.patientnr,
+       o.datum_opname,
+       o.datum_ontslag,
+       COUNT(r.onderznr) AS radiology_count,
+       MIN(r.tijd_invoer) AS first_rad_in_admission,
+       MAX(r.tijd_invoer) AS last_rad_in_admission
+FROM msd_tables.opname_brontabel o
+LEFT JOIN msd_tables.radiologie_brontabel r
+  ON r.patientnr = o.patientnr
+  AND r.tijd_invoer >= o.datum_opname
+  AND r.tijd_invoer <= DATEADD(day,1,CAST(o.datum_ontslag AS datetime))
+GROUP BY o.opnamenr, o.patientnr, o.datum_opname, o.datum_ontslag
+ORDER BY o.datum_opname DESC;
+
+--- seh visits by herkomst en hoeveel patienten hebben een opname gehad in general opname tabel
+select top(100) * from msd_tables.seh_brontabel
+select top(100) * from msd_tables.opname_brontabel
+select top(100) * from msd_tables.radiologie_brontabel
+select top (1000) * from msd_dim.verwijzers_correctie
+select top(100) * from msd_tables.dbc_brontabel
+
+-- hoeveel van de seh visits hebben een opname gehad in opname tabel per herkomst
+SELECT s.herkomst_cat,
+       COUNT(s.sehid) AS seh_visits,
+       SUM(CASE WHEN o.opnamenr IS NOT NULL THEN 1 ELSE 0 END) AS admitted_count
+FROM msd_tables.seh_brontabel s
+LEFT JOIN msd_tables.opname_brontabel o
+  ON s.patientnr = o.patientnr
+  AND o.datum_opname = s.datum_aankomst 
+GROUP BY s.herkomst_cat
+ORDER BY admitted_count DESC;
+
+--- dbc per postcode
+SELECT pk.jaar AS [Year],
+       pk.postcode4 AS pc4,
+       pd.gemeente AS gemeente,
+       COUNT(*) AS record_count,
+       SUM(ISNULL(d.bedrag_verr_extra,0)) AS total_bedrag
+FROM msd_tables.dbc_brontabel d
+JOIN msd_tables.patientkenmerken_historisch pk
+  ON d.patientnr = pk.patientnr
+  AND d.jaar_datum_verr = pk.jaar
+LEFT JOIN msd_dim.postcode4 pd
+  ON pk.postcode4 = pd.pc4
+GROUP BY pk.jaar, pk.postcode4, pd.gemeente
+ORDER BY pk.jaar, total_bedrag DESC;
+
+--- kosten per verrichting en gewogen prijzen per verrichting
+SELECT d.declcode_aangepast,
+       COUNT(d.casenr) AS cnt,
+       AVG(ISNULL(d.bedrag_verr_extra,0)) AS avg_bedrag,
+       gp.gewogen_prijs_per_verr_2023 AS prijs_2023,
+       gp.gemiddeld_prijs_meerjaren AS avg_multi_year_price
+FROM msd_tables.dbc_brontabel d
+LEFT JOIN msd_dim.gewogen_prijs_per_verr gp
+  ON d.declcode_aangepast = gp.declcode_aangepast
+GROUP BY d.declcode_aangepast, gp.gewogen_prijs_per_verr_2023, gp.gemiddeld_prijs_meerjaren
+ORDER BY cnt DESC
+
+--- exploration kinder beschouwend ---
+--- kinderchirurgie en kindergeneeskunde specialismen counts patienten - 173770
+select top(100) * from msd_tables.dbc_brontabel where qs_alt_specialisme_koppeldbc in ('kin', 'klg')
+
+select count(distinct patientnr) from msd_tables.dbc_brontabel where qs_alt_specialisme_koppeldbc in ('kin', 'klg')
+
+--- group by subspecialisme_dbc - waar kan ik subspecialisme definities vinden
+select subspecialisme_dbc, count(distinct patientnr) as Aantal_patienten from msd_tables.dbc_brontabel 
+where qs_alt_specialisme_koppeldbc in ('kin', 'klg') 
+group by subspecialisme_dbc order by Aantal_patienten desc
+
+-- hoeveel kiddos scoren robijn en zijn multispecialistisch +3
+-- 27.796
+select count(distinct patientnr) as Aantal_patienten from msd_tables.dbc_brontabel 
+where qs_alt_specialisme_koppeldbc in ('kin', 'klg') and rb_gelabeld_01_patient_NZA = 1 and multispecialistisch_cat in ('3', '4', '5+')
+
+-- hoeveel special kiddos hebben geen opname en groepeer op verwijzing per subspecialsme
+select v.[Verwijstype omschrijving], COALESCE(NULLIF(d.subspecialisme_dbc, ''), d.specialisme_dbc) as subspecialisme_dbc,  count(distinct patientnr) as Aantal_patienten 
+from msd_tables.dbc_brontabel d
+left join msd_dim.Verwijstype as v on d.type_verwijzer = v.Verwijstype
+where qs_alt_specialisme_koppeldbc in ('kin', 'klg') and 
+rb_gelabeld_01_patient_NZA = 1 and 
+multispecialistisch_cat in ('3', '4', '5+') and 
+poli_aantal != 0 and --- > 1 poli bezoek gehad 
+ligdagen_totaal_aantal = 0 -- geen opname gehad
+group by v.[Verwijstype omschrijving], COALESCE(NULLIF(d.subspecialisme_dbc, ''), d.specialisme_dbc) order by Aantal_patienten desc
+
+
+--- join between ok table and opname table done on opnamenr and make sure the datum_opname equals operatie_datum in ok table, then calculate the average opname duration for patients who had an operation
+--- patienten die een ok hebben en een opname hebben gehad en wat is de avg opname duur van deze patienten 
+select count(distinct o.patientnr) as Aantal_patienten, AVG(DATEDIFF(day, o.datum_opname, o.datum_ontslag)) as Gemiddelde_opnameduur
+from msd_tables.opname_brontabel o
+left join msd_tables.opname_koppeltabel okk on o.opnamenr = okk.opnamenr
+left join msd_tables.ok_brontabel ok on okk.opnamenr = ok.opnamenr
+where o.patientnr in (select distinct patientnr from msd_tables.dbc_brontabel where qs_alt_specialisme_koppeldbc in ('kin', 'klg') and rb_gelabeld_01_patient_NZA = 1 and multispecialistisch_cat in ('3', '4', '5+')) 
+and o.datum_opname = ok.operatie_datum 
+
+--- are their any patients who had an opname before ok and how long
+select count(distinct o.patientnr) as Aantal_patienten, AVG(DATEDIFF(day, o.datum_opname, ok.operatie_datum)) as Gemiddelde_opnameduur
+from msd_tables.opname_brontabel o
+left join msd_tables.opname_koppeltabel okk on o.opnamenr = okk.opnamenr
+left join msd_tables.ok_brontabel ok on okk.opnamenr = ok.opnamenr
+where o.patientnr in (select distinct patientnr from msd_tables.dbc_brontabel where qs_alt_specialisme_koppeldbc in ('kin', 'klg') and rb_gelabeld_01_patient_NZA = 1 and multispecialistisch_cat in ('3', '4', '5+'))
+and o.datum_opname < ok.operatie_datum 
