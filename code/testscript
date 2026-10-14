@@ -155,3 +155,4 @@ left join msd_tables.opname_koppeltabel okk on o.opnamenr = okk.opnamenr
 left join msd_tables.ok_brontabel ok on okk.opnamenr = ok.opnamenr
 where o.patientnr in (select distinct patientnr from msd_tables.dbc_brontabel where qs_alt_specialisme_koppeldbc in ('kin', 'klg') and rb_gelabeld_01_patient_NZA = 1 and multispecialistisch_cat in ('3', '4', '5+'))
 and o.datum_opname < ok.operatie_datum 
+

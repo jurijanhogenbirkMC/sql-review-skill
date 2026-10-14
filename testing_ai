@@ -1,0 +1,331 @@
+
+/*Nieuwe opzet*/ 
+--setting up the patient kenmerken tabel met historische data
+
+/*1. Selectie van jaarrange*/
+DECLARE @MinYear INT = 2017;
+DECLARE @MaxYear INT = 2026;
+
+DROP TABLE IF EXISTS #years;
+CREATE TABLE #years (
+    jaar INT,
+    peildatum DATE,
+    startdatum DATE,
+    einddatum DATE
+);
+
+DECLARE @Year INT = @MinYear;
+
+WHILE @Year <= @MaxYear
+BEGIN
+    INSERT INTO #years
+    SELECT 
+        @Year,
+        DATEFROMPARTS(@Year, 7, 1),
+        DATEFROMPARTS(@Year, 1, 1),
+        DATEFROMPARTS(@Year + 1, 1, 1);
+
+    SET @Year = @Year + 1;
+END;
+
+-- check
+SELECT * FROM #years ORDER BY jaar;
+
+/*2. Brontabel maken*/
+
+/*Stap 2.0: Selecteren van relevante variabelen uit de HIX brontabel*/ 
+DROP TABLE IF EXISTS #patient_historie_totaal_hist
+SELECT distinct 
+PATIENTNR
+,GESLACHT
+,cast(GEBDAT as date) gebdat
+--,GEBPLAATS
+,cast(INGANGSDAT as date) ingangsdat
+,OVERLEDEN
+,cast(OVERLDAT as date) overldat
+,cast(MUTDAT as date) mutdat
+,ADRES
+,HUISNR
+,POSTCODE
+,SUBSTRING(POSTCODE,1,4) as postcode4
+,WOONPLAATS
+,LAND
+,PARTVERZ
+--,AANVVERZ
+,'Obv originele afleiding patient_pathist' as categorie_afleiding
+  INTO #patient_historie_totaal_hist
+  FROM [ZA_PM_HIX].[HIX_PRODUCTIE].[dbo].[PATIENT_PATHIST] 
+  WHERE ingangsdat IS NOT NULL /*later toegevoegd, bijvoorbeeld obv patientnr 0125645*/ or mutdat is not null
+
+--  select distinct * from #patient_historie_totaal_hist where patientnr not in (select distinct patientnr from #patient_historie_totaal_hist_test) and mutdat <> '2017-06-22' order by patientnr,mutdat
+
+/*Stap 2.1: Missende patientnrs selecteren*/ --Later toegevoegd, bijvoorbeeld obv patientnr 2010681
+DROP TABLE IF EXISTS #patient_historie_totaal_extra
+SELECT distinct 
+PATIENTNR
+,GESLACHT
+,cast(GEBDAT as date) gebdat
+--,GEBPLAATS
+,cast(INGANGSDAT as date) ingangsdat
+,OVERLEDEN
+,cast(OVERLDAT as date) overldat
+,cast(MUTDAT as date) mutdat
+,ADRES
+,HUISNR
+,POSTCODE
+,SUBSTRING(POSTCODE,1,4) as postcode4
+,WOONPLAATS
+,LAND
+,PARTVERZ
+--,AANVVERZ
+,'Obv extra patient_patient' as categorie_afleiding
+  INTO #patient_historie_totaal_extra
+  FROM [ZA_PM_HIX].[HIX_PRODUCTIE].[dbo].[PATIENT_PATIENT] 
+  WHERE (ingangsdat IS NOT NULL or mutdat is not null) and patientnr not in (select distinct patientnr from #patient_historie_totaal_hist)
+
+--select distinct * from #patient_historie_totaal_extra where patientnr = '2010681' order by patientnr,ingangsdat,mutdat
+
+/*Samenvoegen*/
+drop table if exists #patient_historie_totaal
+select distinct 
+*
+into #patient_historie_totaal
+from #patient_historie_totaal_hist
+where gebdat is not null and gebdat <> '' and postcode4 <> '' and postcode4 is not null
+union 
+select distinct 
+* 
+from #patient_historie_totaal_extra 
+where gebdat is not null and gebdat <> '' and postcode4 <> '' and postcode4 is not null
+
+/*Ingangs en uitgangsdatum maken*/
+DROP TABLE IF EXISTS #patient_historie_bewerkt
+SELECT distinct *
+,mutdat as ingangsdatum
+,coalesce(dateadd(d, -1, first_value(mutdat) over (partition by patientnr order by mutdat rows between 1 following and 1 following)), cast('29991231' as date)) einddatum
+into #patient_historie_bewerkt
+from #patient_historie_totaal
+order by patientnr, mutdat
+
+/*3. Tabel maken op basis van peildatum en anders meest recente opties binnen jaar (fallback)*/
+DROP TABLE IF EXISTS #vulling_peildatum
+SELECT 
+    t1.jaar,
+    t1.peildatum,
+    t2.patientnr,
+    t2.geslacht,
+    t2.gebdat,
+    t2.ingangsdat,
+    t2.overleden,
+    t2.overldat,
+    t2.mutdat,
+    t2.adres,
+    t2.huisnr,
+    t2.postcode,
+    t2.postcode4,
+    t2.woonplaats,
+    t2.land,
+    t2.partverz,
+    t2.ingangsdatum,
+    t2.einddatum
+INTO #vulling_peildatum
+FROM #years t1
+inner JOIN #patient_historie_bewerkt t2 ON (t2.ingangsdatum < t1.peildatum) AND (t2.einddatum >= t1.peildatum) AND (t2.einddatum >= t2.ingangsdatum)
+
+DROP TABLE IF EXISTS #fallback_candidates
+SELECT 
+    t1.jaar,
+    t2.*
+INTO #fallback_candidates
+FROM #years t1
+inner JOIN #patient_historie_bewerkt t2 ON (t2.ingangsdatum < t1.einddatum) and (t2.einddatum >= t1.startdatum) and (t2.einddatum >= t2.ingangsdatum)
+
+DROP TABLE IF EXISTS #fallback_ranked
+SELECT 
+    jaar,
+    patientnr,
+    geslacht,
+    gebdat,
+    ingangsdat,
+    overleden,
+    overldat,
+    mutdat,
+    adres,
+    huisnr, 
+    postcode,
+    postcode4,
+    woonplaats,
+    land,
+    partverz,
+    ingangsdatum,
+    einddatum,
+    ROW_NUMBER() OVER (PARTITION BY jaar, patientnr  ORDER BY einddatum DESC) AS rn
+INTO #fallback_ranked
+FROM #fallback_candidates
+
+-- check
+SELECT TOP 100 *
+FROM #fallback_ranked
+ORDER BY jaar, patientnr, rn
+
+DROP TABLE IF EXISTS #fallback_best
+SELECT 
+    jaar,
+    patientnr,
+    geslacht,
+    gebdat,
+    ingangsdat,
+    overleden,
+    overldat,
+    mutdat,
+    adres,
+    huisnr,
+    postcode,
+    postcode4,
+    woonplaats,
+    land,
+    partverz,
+    ingangsdatum,
+    einddatum
+INTO #fallback_best
+FROM #fallback_ranked
+WHERE rn = 1
+
+-- dan alleen MISSENDE patiënten aanvullen
+drop table if exists #vulling_all_fallback
+SELECT 
+    t1.jaar,
+    t2.peildatum,
+    t1.patientnr,
+    t1.geslacht,
+    t1.gebdat,
+    t1.ingangsdat,
+    t1.overleden,
+    t1.overldat,
+    t1.mutdat,
+    t1.adres, 
+    t1.huisnr,
+    t1.postcode,
+    t1.postcode4,
+    t1.woonplaats,
+    t1.land,
+    t1.partverz,
+    t1.ingangsdatum,
+    t1.einddatum
+into #vulling_all_fallback
+FROM #fallback_best t1
+inner JOIN #years t2 ON t1.jaar = t2.jaar
+LEFT JOIN #vulling_peildatum t3 ON t1.jaar = t3.jaar and t1.patientnr = t3.patientnr
+WHERE t3.patientnr IS NULL
+
+drop table if exists #vulling_all
+select distinct
+*
+into #vulling_all
+from #vulling_peildatum
+union all
+select distinct
+*
+from #vulling_all_fallback
+
+/*Verzekeraar dim tabel maken*/
+DROP TABLE IF EXISTS #dim_verzekeraar
+SELECT DISTINCT VERZEKERIN
+,TBIGROEP 
+,case when begindatum IS NULL then cast('19910101' as date) else begindatum end as begindatum
+,case when einddatum IS NULL then cast('29990101' as date) else einddatum end as einddatum
+INTO #dim_verzekeraar
+FROM [ZA_PM_HIX].[HIX_PRODUCTIE].[DBO].[FAKTUUR_INSGRPIN]
+
+/*Eindtabel*/
+drop table if exists msd_tables.patientkenmerken_historisch
+select distinct 
+t1.jaar
+,t1.peildatum
+,t1.patientnr
+,t1.geslacht
+,case when t1.geslacht = 'V' then 'Vrouwen' when t1.geslacht = 'M' then 'Mannen' else '' end as geslacht_oms
+,t1.gebdat as geboortedatum
+,case when (floor(datediff(day,t1.gebdat,t1.peildatum)/365.25)) < 0 then 0 else (floor(datediff(day,t1.gebdat,t1.peildatum)/365.25)) end  as leeftijd_peildatum
+,case when (floor(datediff(day,t1.gebdat,t1.peildatum)/365.25)) < 5 then '0 tot 5 jaar'
+	when (floor(datediff(day,t1.gebdat,t1.peildatum)/365.25)) < 10 then '5 tot 10 jaar'
+	when (floor(datediff(day,t1.gebdat,t1.peildatum)/365.25)) < 15 then '10 tot 15 jaar'
+	when (floor(datediff(day,t1.gebdat,t1.peildatum)/365.25)) < 20 then '15 tot 20 jaar'
+	when (floor(datediff(day,t1.gebdat,t1.peildatum)/365.25)) < 25 then '20 tot 25 jaar'
+	when (floor(datediff(day,t1.gebdat,t1.peildatum)/365.25)) < 30 then '25 tot 30 jaar'
+	when (floor(datediff(day,t1.gebdat,t1.peildatum)/365.25)) < 35 then '30 tot 35 jaar'
+	when (floor(datediff(day,t1.gebdat,t1.peildatum)/365.25)) < 40 then '35 tot 40 jaar'
+	when (floor(datediff(day,t1.gebdat,t1.peildatum)/365.25)) < 45 then '40 tot 45 jaar'
+	when (floor(datediff(day,t1.gebdat,t1.peildatum)/365.25)) < 50 then '45 tot 50 jaar'
+	when (floor(datediff(day,t1.gebdat,t1.peildatum)/365.25)) < 55 then '50 tot 55 jaar'
+	when (floor(datediff(day,t1.gebdat,t1.peildatum)/365.25)) < 60 then '55 tot 60 jaar'
+	when (floor(datediff(day,t1.gebdat,t1.peildatum)/365.25)) < 65 then '60 tot 65 jaar'
+	when (floor(datediff(day,t1.gebdat,t1.peildatum)/365.25)) < 70 then '65 tot 70 jaar'
+	when (floor(datediff(day,t1.gebdat,t1.peildatum)/365.25)) < 75 then '70 tot 75 jaar'
+	when (floor(datediff(day,t1.gebdat,t1.peildatum)/365.25)) < 80 then '75 tot 80 jaar'
+	when (floor(datediff(day,t1.gebdat,t1.peildatum)/365.25)) < 85 then '80 tot 85 jaar'
+	when (floor(datediff(day,t1.gebdat,t1.peildatum)/365.25)) < 90 then '85 tot 90 jaar'
+	when (floor(datediff(day,t1.gebdat,t1.peildatum)/365.25)) < 95 then '90 tot 95 jaar'
+	when (floor(datediff(day,t1.gebdat,t1.peildatum)/365.25)) < 150 then '95 jaar of ouder' else '' end as leeftijdsgroep_peildatum
+,t1.postcode as postcode6
+,t1.postcode4
+,t1.partverz as verzekeraar_code
+,t2.TBIGROEP as verzekeraar
+,t1.overleden as overleden_01
+,t1.overldat as datum_overleden
+,t1.land
+into msd_tables.patientkenmerken_historisch
+from #vulling_all t1
+left join #dim_verzekeraar t2 on (t1.partverz = t2.VERZEKERIN) and (t1.peildatum between t2.begindatum and t2.einddatum)
+
+/*Check*/
+select distinct jaar,patientnr,count(*) as dubbeling from msd_tables.patientkenmerken_historisch group by jaar,patientnr having count(*) > 1 order by count(*) desc
+
+/*Tijdelijke tabel met gevoelige patientkenmerken
+--Deze wordt verwijderd na het maken en updaten van de query rondom moeder-kind*/
+
+drop table if exists msd_temp.patientkenmerken_historisch_detail
+select distinct 
+t1.jaar
+,t1.peildatum
+,t1.patientnr
+,t1.geslacht
+,case when t1.geslacht = 'V' then 'Vrouwen' when t1.geslacht = 'M' then 'Mannen' else '' end as geslacht_oms
+,t1.gebdat as geboortedatum
+,case when (floor(datediff(day,t1.gebdat,t1.peildatum)/365.25)) < 0 then 0 else (floor(datediff(day,t1.gebdat,t1.peildatum)/365.25)) end  as leeftijd_peildatum
+,case when (floor(datediff(day,t1.gebdat,t1.peildatum)/365.25)) < 5 then '0 tot 5 jaar'
+	when (floor(datediff(day,t1.gebdat,t1.peildatum)/365.25)) < 10 then '5 tot 10 jaar'
+	when (floor(datediff(day,t1.gebdat,t1.peildatum)/365.25)) < 15 then '10 tot 15 jaar'
+	when (floor(datediff(day,t1.gebdat,t1.peildatum)/365.25)) < 20 then '15 tot 20 jaar'
+	when (floor(datediff(day,t1.gebdat,t1.peildatum)/365.25)) < 25 then '20 tot 25 jaar'
+	when (floor(datediff(day,t1.gebdat,t1.peildatum)/365.25)) < 30 then '25 tot 30 jaar'
+	when (floor(datediff(day,t1.gebdat,t1.peildatum)/365.25)) < 35 then '30 tot 35 jaar'
+	when (floor(datediff(day,t1.gebdat,t1.peildatum)/365.25)) < 40 then '35 tot 40 jaar'
+	when (floor(datediff(day,t1.gebdat,t1.peildatum)/365.25)) < 45 then '40 tot 45 jaar'
+	when (floor(datediff(day,t1.gebdat,t1.peildatum)/365.25)) < 50 then '45 tot 50 jaar'
+	when (floor(datediff(day,t1.gebdat,t1.peildatum)/365.25)) < 55 then '50 tot 55 jaar'
+	when (floor(datediff(day,t1.gebdat,t1.peildatum)/365.25)) < 60 then '55 tot 60 jaar'
+	when (floor(datediff(day,t1.gebdat,t1.peildatum)/365.25)) < 65 then '60 tot 65 jaar'
+	when (floor(datediff(day,t1.gebdat,t1.peildatum)/365.25)) < 70 then '65 tot 70 jaar'
+	when (floor(datediff(day,t1.gebdat,t1.peildatum)/365.25)) < 75 then '70 tot 75 jaar'
+	when (floor(datediff(day,t1.gebdat,t1.peildatum)/365.25)) < 80 then '75 tot 80 jaar'
+	when (floor(datediff(day,t1.gebdat,t1.peildatum)/365.25)) < 85 then '80 tot 85 jaar'
+	when (floor(datediff(day,t1.gebdat,t1.peildatum)/365.25)) < 90 then '85 tot 90 jaar'
+	when (floor(datediff(day,t1.gebdat,t1.peildatum)/365.25)) < 95 then '90 tot 95 jaar'
+	when (floor(datediff(day,t1.gebdat,t1.peildatum)/365.25)) < 150 then '95 jaar of ouder' else '' end as leeftijdsgroep_peildatum
+,t1.postcode as postcode6
+,t1.postcode4
+,t1.woonplaats
+,t1.adres
+,t1.huisnr
+,t1.partverz as verzekeraar_code
+,t2.TBIGROEP as verzekeraar
+,t1.overleden as overleden_01
+,t1.overldat as datum_overleden
+,t1.land
+into msd_temp.patientkenmerken_historisch_detail
+from #vulling_all t1
+left join #dim_verzekeraar t2 on (t1.partverz = t2.VERZEKERIN) and (t1.peildatum between t2.begindatum and t2.einddatum)
+
+select distinct jaar,patientnr,count(*) as dubbeling from msd_temp.patientkenmerken_historisch_detail group by jaar,patientnr having count(*) > 1 order by count(*) desc
+
